@@ -6,7 +6,7 @@
 ## Установка (Windows, venv, CPU)
 
 ```powershell
-git clone <repo_url> drl_playground
+git clone https://github.com/sherokiddo/drl-playground drl_playground
 cd drl_playground
 
 python -m venv .venv
