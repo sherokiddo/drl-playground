@@ -80,9 +80,48 @@ class DQNAgent:
         with torch.no_grad():
             q_values = self.q_net(state_tensor)
         action = int(torch.argmax(q_values, dim=1).item())
-        
+
         return action
 
     def train_step(self, batch):
-        """Один шаг обучения по батчу из replay buffer."""
-        raise NotImplementedError("DQNAgent.train_step ещё не реализован")
+        """
+        Один шаг обучения по батчу из replay buffer.
+
+        batch: Transition из ReplayBuffer.sample, где
+          batch.state      -> tuple(np.array)
+          batch.action     -> tuple(int)
+          batch.reward     -> tuple(float)
+          batch.next_state -> tuple(np.array)
+          batch.done       -> tuple(bool)
+        """
+
+        states      = np.array(batch.state, dtype=np.float32)
+        actions     = np.array(batch.action, dtype=np.int64)
+        rewards     = np.array(batch.reward, dtype=np.float32)
+        next_states = np.array(batch.next_state, dtype=np.float32)
+        dones       = np.array(batch.done, dtype=np.float32)
+
+        states      = torch.as_tensor(states, device=self.device)
+        actions     = torch.as_tensor(actions, device=self.device).unsqueeze(-1)
+        rewards     = torch.as_tensor(rewards, device=self.device).unsqueeze(-1)
+        next_states = torch.as_tensor(next_states, device=self.device)
+        dones       = torch.as_tensor(dones, device=self.device).unsqueeze(-1)
+
+        # Считаем Q(s,a)
+        q_values    = self.q_net(states)
+        q_values    = q_values.gather(1, actions)
+
+        # Считаем target \(y\)
+        with torch.no_grad():
+            next_q_values       = self.target_q_net(next_states)
+            max_next_q_values, _= next_q_values.max(dim=1, keepdim=True)
+            target_q_values     = rewards + self.gamma * (1.0 - dones) * max_next_q_values
+
+        # Функция потери: MSE между текущими Q и целевыми
+        loss = torch.nn.functional.mse_loss(q_values, target_q_values)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return loss.item()
