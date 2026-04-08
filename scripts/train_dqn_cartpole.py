@@ -78,7 +78,7 @@ def main():
         episode_rewards.append(total_reward)
 
         if (episode + 1) % 10 == 0:
-            avg_reward  = sum(episode_rewards[-10:])
+            avg_reward  = np.mean(episode_rewards[-10:])
             current_eps = agent._get_epsilon()
             print(
                 f"Episode {episode+1:>3} | "
