@@ -10,12 +10,13 @@ EVAL_N_UE = 40
 def make_env():
     return LTESchedulerEnv(
         n_ue=EVAL_N_UE,
-        n_rbg=16,
+        n_rb_dl=50,
         episode_len=200,
         reward_mode="per_tti",
         reward_window=10,
-        bandwidth_hz=10e6,
+        wb_cqi_report_period_tti=5,
         traffic_lambda=5000.0,
+        traffic_profile="on_off",
         seed=123,
     )
 

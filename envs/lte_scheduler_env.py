@@ -64,7 +64,14 @@ CQI_BITS_PER_RE = {
 }
 
 RE_PER_RB_TTI = 132   # RE на RB за 1 TTI (нормальный CP, без управляющих)
-RB_PER_RBG    = 3     # 10 МГц: 50 RB -> 16 RBG по 3 RB
+LTE_N_RB_DL_TO_BANDWIDTH_HZ = {
+    6: 1.4e6,
+    15: 3e6,
+    25: 5e6,
+    50: 10e6,
+    75: 15e6,
+    100: 20e6,
+}
 
 # Марковская цепь CQI: P_STAY=0.7, P_STEP=0.15 (вверх/вниз)
 _P_STAY, _P_STEP = 0.7, 0.15
@@ -84,6 +91,64 @@ CQI_TRANSITION  = _build_cqi_transition_matrix()
 MAX_BUFFER_BYTES = 1_000_000   # 1 МБ
 MAX_AVG_TPUT     = 100e6       # 100 Мбит/с
 
+TRAFFIC_MODE_FULL_BUFFER = "full_buffer"
+TRAFFIC_MODE_ON_OFF = "on_off"
+TRAFFIC_MODE_BURSTY = "bursty"
+
+SUPPORTED_TRAFFIC_MODES = (
+    TRAFFIC_MODE_FULL_BUFFER,
+    TRAFFIC_MODE_ON_OFF,
+    TRAFFIC_MODE_BURSTY,
+)
+
+
+def _normalize_traffic_profile(
+    traffic_profile: str | list[str] | tuple[str, ...],
+    n_ue: int,
+) -> list[str]:
+    if isinstance(traffic_profile, str):
+        modes = [traffic_profile] * n_ue
+    else:
+        modes = list(traffic_profile)
+        if len(modes) != n_ue:
+            raise ValueError(
+                f"traffic_profile length must match n_ue={n_ue}, got {len(modes)}"
+            )
+
+    for mode in modes:
+        if mode not in SUPPORTED_TRAFFIC_MODES:
+            raise ValueError(
+                f"Unsupported traffic mode: {mode}. "
+                f"Supported modes: {SUPPORTED_TRAFFIC_MODES}"
+            )
+
+    return modes
+
+def _build_rat0_rbg_rb_sizes(n_rb_dl: int) -> np.ndarray:
+    p = _get_rat0_rbg_size(n_rb_dl)
+    n_full = n_rb_dl // p
+    remainder = n_rb_dl % p
+
+    sizes = [p] * n_full
+    if remainder > 0:
+        sizes.append(remainder)
+
+    return np.array(sizes, dtype=np.int32)
+
+def _get_bandwidth_hz_from_n_rb_dl(n_rb_dl: int) -> float:
+    if n_rb_dl not in LTE_N_RB_DL_TO_BANDWIDTH_HZ:
+        raise ValueError(f"Unsupported n_rb_dl={n_rb_dl}")
+    return float(LTE_N_RB_DL_TO_BANDWIDTH_HZ[n_rb_dl])
+
+def _get_rat0_rbg_size(n_rb_dl: int) -> int:
+    if n_rb_dl <= 10:
+        return 1
+    elif 11 <= n_rb_dl <= 26:
+        return 2
+    elif 27 <= n_rb_dl <=63:
+        return 3
+    else:
+        return 4
 
 # ---------------------------------------------------------------------------
 # Среда Gymnasium
@@ -110,25 +175,37 @@ class LTESchedulerEnv(gym.Env):
     """
 
     metadata = {"render_modes": []}
-    N_UE_FEATURES      = 3
+    N_UE_FEATURES      = 6
     N_CONTEXT_FEATURES = 3
 
     def __init__(
         self,
-        n_ue:           int   = 40,
-        n_rbg:          int   = 16,
+        n_ue:           int   = 3,
+        n_rb_dl:        int   = 50,
         episode_len:    int   = 500,
         reward_mode:    str   = "delayed",
         reward_window:  int   = 10,
         alpha:          float = 0.5,
         beta:           float = 0.5,
-        bandwidth_hz:   float = 10e6,
         cqi_markov:     bool  = True,
-        traffic_lambda: float = 5000.0,
+        wb_cqi_report_period_tti: int = 5,
+        wb_cqi_report_with_random_offset: bool = True,
+
+        traffic_lambda:     float = 5000.0,
+        traffic_profile:    str | list[str] | tuple[str, ...] = TRAFFIC_MODE_FULL_BUFFER,
+        on_lambda_bytes:    float = 5000.0,
+        off_lambda_bytes:   float = 0.0,
+        on_off_p_on_to_off: float = 0.05,
+        on_off_p_off_to_on: float = 0.10,
+        burst_lambda_bytes: float = 12000.0,
+        burst_start_prob:   float = 0.08,
+        burst_mean_tti:     int   = 5,
+
         rate_scale_bps: float = 1e6,
         jfi_target:     float = 0.7,   
         lambda_jfi:     float = 1.0, 
         seed:           Optional[int] = None,
+        bandwidth_hz:   Optional[int] = None,
         ):
         super().__init__()
 
@@ -137,20 +214,47 @@ class LTESchedulerEnv(gym.Env):
         assert n_ue >= 1, "n_ue должен быть >= 1"
 
         self.n_ue           = n_ue
-        self.n_rbg          = n_rbg
         self.episode_len    = episode_len
         self.reward_mode    = reward_mode
         self.reward_window  = reward_window
         self.alpha          = alpha
         self.beta           = beta
-        self.bandwidth_hz   = bandwidth_hz
+        expected_bandwidth_hz = _get_bandwidth_hz_from_n_rb_dl(n_rb_dl)
+
+        if bandwidth_hz is None:
+            self.bandwidth_hz = expected_bandwidth_hz
+        elif not np.isclose(float(bandwidth_hz), expected_bandwidth_hz):
+            raise ValueError(
+                f"bandwidth_hz={bandwidth_hz} does not match "
+                f"n_rb_dl={n_rb_dl} (expected {expected_bandwidth_hz})"
+            )
+        else:
+            self.bandwidth_hz = float(bandwidth_hz)
+
         self.cqi_markov     = cqi_markov
-        self.traffic_lambda = traffic_lambda
+        self.wb_cqi_report_period_tti = max(int(wb_cqi_report_period_tti), 1)
+        self.wb_cqi_report_with_random_offset = bool(wb_cqi_report_with_random_offset)
+
+        self.traffic_lambda     = traffic_lambda
+        self.traffic_profile    = _normalize_traffic_profile(traffic_profile, n_ue)
+        self.on_lambda_bytes    = on_lambda_bytes
+        self.off_lambda_bytes   = off_lambda_bytes
+        self.on_off_p_on_to_off = on_off_p_on_to_off
+        self.on_off_p_off_to_on = on_off_p_off_to_on
+        self.burst_lambda_bytes = burst_lambda_bytes
+        self.burst_start_prob   = burst_start_prob
+        self.burst_mean_tti     = max(int(burst_mean_tti), 1)
+
         self.rate_scale_bps = rate_scale_bps
         self.jfi_target     = jfi_target 
         self.lambda_jfi     = lambda_jfi
         self._last_rbg_alloc = None
-        self.grid_history   = [] 
+        self.grid_history   = []
+        self.n_rb_dl        = n_rb_dl
+        self.rbg_size_rb    = _get_rat0_rbg_size(self.n_rb_dl)
+        self.rbg_rb_sizes   = _build_rat0_rbg_rb_sizes(self.n_rb_dl)
+        self.n_rbg          = int(len(self.rbg_rb_sizes))
+        self.last_rbg_size_rb = int(self.rbg_rb_sizes[-1])
 
         obs_dim = n_ue * self.N_UE_FEATURES + self.N_CONTEXT_FEATURES
         self.observation_space = spaces.Box(
@@ -159,15 +263,24 @@ class LTESchedulerEnv(gym.Env):
         self.action_space = spaces.Discrete(n_ue)
 
         self._rng: np.random.Generator = np.random.default_rng(seed)
-        self._cqi:         np.ndarray  = None
-        self._buffer:      np.ndarray  = None
-        self._avg_tput:    np.ndarray  = None
-        self._rbg_alloc:   np.ndarray  = None
-        self._current_rbg: int         = 0
-        self._current_tti: int         = 0
+        self._true_wb_cqi:         np.ndarray  = None
+        self._reported_wb_cqi:     np.ndarray  = None
+        self._wb_cqi_age:          np.ndarray  = None
+        self._wb_cqi_report_offset: np.ndarray = None
+        self._buffer:              np.ndarray  = None
+        self._avg_tput:            np.ndarray  = None
+        self._rbg_alloc:           np.ndarray  = None
+        self._current_rbg:         int         = 0
+        self._current_tti:         int         = 0
         self._reward_accum: float      = 0.0
         self._window_count: int        = 0
         self._ema_alpha = 0.01  # EMA ~100 TTI
+
+        self._traffic_mode: np.ndarray = None
+        self._traffic_on: np.ndarray   = None
+        self._burst_timer: np.ndarray  = None
+        self._active_flag: np.ndarray  = None
+
 
         self.history: Dict[str, list] = {"throughput": [], "se": [], "jfi": [], "reward": []}
 
@@ -184,9 +297,36 @@ class LTESchedulerEnv(gym.Env):
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
-        self._cqi      = self._rng.integers(4, 13, size=self.n_ue)
+        self._true_wb_cqi = self._rng.integers(4, 13, size=self.n_ue)
+        self._reported_wb_cqi = self._true_wb_cqi.copy()
+        self._wb_cqi_age = np.zeros(self.n_ue, dtype=np.int32)
+        if self.wb_cqi_report_with_random_offset and self.wb_cqi_report_period_tti > 1:
+            self._wb_cqi_report_offset = self._rng.integers(
+                0,
+                self.wb_cqi_report_period_tti,
+                size=self.n_ue,
+                dtype=np.int32,
+            )
+        else:
+            self._wb_cqi_report_offset = np.zeros(self.n_ue, dtype=np.int32)
+
         self._buffer   = self._rng.uniform(10_000, 50_000, size=self.n_ue)
         self._avg_tput = np.zeros(self.n_ue, dtype=np.float64)
+
+        self._traffic_mode  = np.array(self.traffic_profile, dtype=object)
+        self._traffic_on    = np.zeros(self.n_ue, dtype=bool)
+        self._burst_timer   = np.zeros(self.n_ue, dtype=np.int32)
+
+        for i, mode in enumerate(self._traffic_mode):
+            if mode == TRAFFIC_MODE_FULL_BUFFER:
+                self._traffic_on[i] = True
+            elif mode == TRAFFIC_MODE_ON_OFF:
+                self._traffic_on[i] = bool(self._rng.random() < 0.5)
+            elif mode == TRAFFIC_MODE_BURSTY:
+                self._traffic_on[i] = False
+                self._burst_timer[i] = 0
+
+        self._active_flag = self._buffer > 0.0
 
         self._rbg_alloc   = np.full(self.n_rbg, -1, dtype=np.int32)
         self._current_rbg = 0
@@ -207,6 +347,7 @@ class LTESchedulerEnv(gym.Env):
         assert self.action_space.contains(action), \
             f"Недопустимое действие: {action}"
 
+        invalid_action = not bool(self._get_action_mask()[action])
         self._rbg_alloc[self._current_rbg] = action
         self._current_rbg += 1
 
@@ -227,7 +368,9 @@ class LTESchedulerEnv(gym.Env):
             if self._current_tti >= self.episode_len:
                 terminated = True
 
-        return self._get_obs(), reward, terminated, truncated, self._get_info()
+        info = self._get_info()
+        info["invalid_action"] = invalid_action
+        return self._get_obs(), reward, terminated, truncated, info
 
     # ------------------------------------------------------------------
     # Обработка TTI
@@ -245,13 +388,14 @@ class LTESchedulerEnv(gym.Env):
         )
 
         if self.cqi_markov:
-            self._update_cqi()
+            self._update_true_wb_cqi()
+        self._update_wb_cqi_reports()
 
         throughput_bps = float(np.sum(tti_tput_bps))
         se_bps_hz      = throughput_bps / self.bandwidth_hz
         jfi            = self._compute_jfi(self._avg_tput)
 
-        self.history["throughput"].append(throughput_bps / 1e6)  # Мбит/с
+        self.history["throughput"].append(throughput_bps / 1e6) 
         self.history["se"].append(se_bps_hz)
         self.history["jfi"].append(jfi)
 
@@ -281,39 +425,113 @@ class LTESchedulerEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def _compute_bits_delivered(self) -> np.ndarray:
-        bits = np.zeros(self.n_ue, dtype=np.float64)
-        for i in range(self.n_ue):
-            n_rbg = int(np.sum(self._rbg_alloc == i))
-            if n_rbg == 0:
+        raw_bits = np.zeros(self.n_ue, dtype=np.float64)
+
+        for rbg_idx in range(self.n_rbg):
+            ue = self._rbg_alloc[rbg_idx]
+            if ue < 0:
                 continue
-            bpre     = CQI_BITS_PER_RE.get(int(self._cqi[i]), 0.0)
-            raw_bits = n_rbg * RB_PER_RBG * RE_PER_RB_TTI * bpre
-            buf_bits = self._buffer[i] * 8.0
-            bits[i]  = min(raw_bits, buf_bits)  # ограничение буфером
-        return bits
+
+            rb_count = self.rbg_rb_sizes[rbg_idx]
+            bpre = CQI_BITS_PER_RE.get(int(self._true_wb_cqi[ue]), 0.0)
+            raw_bits[ue] += rb_count * RE_PER_RB_TTI * bpre
+
+        buf_bits = self._buffer * 8.0
+        return np.minimum(raw_bits, buf_bits)
 
     # ------------------------------------------------------------------
-    # Обновление буферов (Пуассон)
+    # Обновление буферов
     # ------------------------------------------------------------------
+
+    def _sample_new_bytes(self) -> np.ndarray:
+        new_bytes = np.zeros(self.n_ue, dtype=np.float64)
+
+        for i, mode in enumerate(self._traffic_mode):
+            if mode == TRAFFIC_MODE_FULL_BUFFER:
+                new_bytes[i] = float(self._rng.poisson(self.traffic_lambda))
+
+            elif mode == TRAFFIC_MODE_ON_OFF:
+                if self._traffic_on[i]:
+                    if self._rng.random() < self.on_off_p_on_to_off:
+                        self._traffic_on[i] = False
+                else:
+                    if self._rng.random() < self.on_off_p_off_to_on:
+                        self._traffic_on[i] = True
+
+                lam = self.on_lambda_bytes if self._traffic_on[i] else self.off_lambda_bytes
+                new_bytes[i] = float(self._rng.poisson(lam))
+
+            elif mode == TRAFFIC_MODE_BURSTY:
+                if self._burst_timer[i] > 0:
+                    self._burst_timer[i] -= 1
+                    self._traffic_on[i] = True
+                    new_bytes[i] = float(self._rng.poisson(self.burst_lambda_bytes))
+                else:
+                    self._traffic_on[i] = False
+                    if self._rng.random() < self.burst_start_prob:
+                        self._burst_timer[i] = max(
+                            1,
+                            int(self._rng.poisson(self.burst_mean_tti)),
+                        )
+                        self._traffic_on[i] = True
+                        new_bytes[i] = float(self._rng.poisson(self.burst_lambda_bytes))
+
+        return new_bytes
 
     def _update_buffers(self, bits_delivered: np.ndarray) -> None:
         bytes_out = bits_delivered / 8.0
-        new_bytes  = self._rng.poisson(
-            self.traffic_lambda, size=self.n_ue
-        ).astype(np.float64)
+        new_bytes = self._sample_new_bytes()
+
         self._buffer = np.clip(
             self._buffer - bytes_out + new_bytes,
-            0.0, MAX_BUFFER_BYTES,
+            0.0,
+            MAX_BUFFER_BYTES,
         )
+
+        self._active_flag = self._buffer > 0.0
 
     # ------------------------------------------------------------------
     # Обновление CQI (Марков)
     # ------------------------------------------------------------------
 
-    def _update_cqi(self) -> None:
+    def _update_true_wb_cqi(self) -> None:
         for i in range(self.n_ue):
-            cqi_idx     = int(self._cqi[i]) - 1
-            self._cqi[i] = self._rng.choice(15, p=CQI_TRANSITION[cqi_idx]) + 1
+            cqi_idx = int(self._true_wb_cqi[i]) - 1
+            self._true_wb_cqi[i] = self._rng.choice(15, p=CQI_TRANSITION[cqi_idx]) + 1
+
+    def _update_wb_cqi_reports(self) -> None:
+        next_tti = self._current_tti + 1
+        for i in range(self.n_ue):
+            due = (
+                self.wb_cqi_report_period_tti <= 1
+                or (next_tti + int(self._wb_cqi_report_offset[i])) % self.wb_cqi_report_period_tti == 0
+            )
+
+            if due:
+                self._reported_wb_cqi[i] = self._true_wb_cqi[i]
+                self._wb_cqi_age[i] = 0
+            else:
+                self._wb_cqi_age[i] += 1
+
+    def _get_wb_cqi_age_norm(self) -> np.ndarray:
+        age_denom = max(self.wb_cqi_report_period_tti - 1, 1)
+        return np.clip(self._wb_cqi_age.astype(np.float32) / age_denom, 0.0, 1.0)
+
+    def _get_alloc_count_per_ue(self) -> np.ndarray:
+        counts = np.zeros(self.n_ue, dtype=np.int32)
+        for ue in range(self.n_ue):
+            counts[ue] = int(np.sum(self._rbg_alloc == ue))
+        return counts
+
+    def _get_alloc_frac_per_ue(self) -> np.ndarray:
+        alloc_counts = self._get_alloc_count_per_ue().astype(np.float32)
+        return alloc_counts / max(self.n_rbg, 1)
+
+    def _get_action_mask(self) -> np.ndarray:
+        mask = self._active_flag.astype(bool).copy()
+        if not np.any(mask):
+            mask[:] = True
+        return mask
 
     # ------------------------------------------------------------------
     # Метрики
@@ -352,11 +570,16 @@ class LTESchedulerEnv(gym.Env):
             self.n_ue * self.N_UE_FEATURES + self.N_CONTEXT_FEATURES,
             dtype=np.float32,
         )
+        wb_cqi_age_norm = self._get_wb_cqi_age_norm()
+        alloc_frac_per_ue = self._get_alloc_frac_per_ue()
         for i in range(self.n_ue):
             b = i * self.N_UE_FEATURES
-            obs[b + 0] = float(self._cqi[i])      / 15.0
-            obs[b + 1] = float(self._buffer[i])   / MAX_BUFFER_BYTES
-            obs[b + 2] = float(self._avg_tput[i]) / MAX_AVG_TPUT
+            obs[b + 0] = float(self._reported_wb_cqi[i]) / 15.0
+            obs[b + 1] = float(wb_cqi_age_norm[i])
+            obs[b + 2] = float(self._active_flag[i])
+            obs[b + 3] = float(self._buffer[i]) / MAX_BUFFER_BYTES
+            obs[b + 4] = float(self._avg_tput[i]) / MAX_AVG_TPUT
+            obs[b + 5] = float(alloc_frac_per_ue[i])
 
         c = self.n_ue * self.N_UE_FEATURES
         obs[c + 0] = self._current_rbg / self.n_rbg
@@ -366,13 +589,32 @@ class LTESchedulerEnv(gym.Env):
         return np.clip(obs, 0.0, 1.0)
 
     def _get_info(self) -> Dict[str, Any]:
+        alloc_count_per_ue = self._get_alloc_count_per_ue()
+        alloc_frac_per_ue = self._get_alloc_frac_per_ue()
+        action_mask = self._get_action_mask()
         return {
             "tti":          self._current_tti,
             "rbg_step":     self._current_rbg,
-            "cqi":          self._cqi.copy(),
+            "cqi":          self._reported_wb_cqi.copy(),
+            "true_wb_cqi":  self._true_wb_cqi.copy(),
+            "reported_wb_cqi": self._reported_wb_cqi.copy(),
+            "wb_cqi_age":   self._wb_cqi_age.copy(),
+            "wb_cqi_report_period_tti": self.wb_cqi_report_period_tti,
+            "wb_cqi_report_offset": self._wb_cqi_report_offset.copy(),
             "buffer_bytes": self._buffer.copy(),
             "avg_tput_bps": self._avg_tput.copy(),
             "rbg_alloc":    self._rbg_alloc.copy(),
+            "n_rb_dl":      self.n_rb_dl,
+            "n_rbg":        self.n_rbg,
+            "rbg_size_rb":  self.rbg_size_rb,
+            "rbg_rb_sizes": self.rbg_rb_sizes.copy(),
+            "active_flag":  self._active_flag.copy(),
+            "alloc_rbg_count_tti": alloc_count_per_ue,
+            "alloc_rbg_frac_tti": alloc_frac_per_ue,
+            "action_mask":  action_mask,
+            "traffic_mode": self._traffic_mode.copy(),
+            "traffic_on":   self._traffic_on.copy(),
+            "burst_timer":  self._burst_timer.copy(),
         }
 
     # ------------------------------------------------------------------
@@ -410,8 +652,13 @@ class LTESchedulerEnv(gym.Env):
         tti = self._current_tti - 1
 
         print(f"\n[RENDER] TTI {tti}")
-        print(f"  CQI:      {self._cqi.astype(int).tolist()}")
+        print(f"  TrueCQI:  {self._true_wb_cqi.astype(int).tolist()}")
+        print(f"  RepCQI:   {self._reported_wb_cqi.astype(int).tolist()}")
+        print(f"  CQIAge:   {self._wb_cqi_age.astype(int).tolist()}")
         print(f"  BufferKB: {[round(b/1024, 1) for b in self._buffer]}")
+        print(f"  Active:   {self._active_flag.astype(int).tolist()}")
+        print(f"  ActMask:  {self._get_action_mask().astype(int).tolist()}")
+        print(f"  Traffic:  {self._traffic_mode.tolist()}")
         print(f"  AvgTput:  {[round(r/1e6, 3) for r in self._avg_tput]} Мбит/с")
         if self.history["jfi"]:
             print(f"  JFI(avg): {self.history['jfi'][-1]:.3f}")

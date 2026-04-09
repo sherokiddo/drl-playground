@@ -7,19 +7,20 @@ import csv
 
 def make_env():
     env = LTESchedulerEnv(
-        n_ue=3,
-        n_rbg=16,
-        episode_len=500,
-        reward_mode="per_tti",
-        reward_window=1,
-        alpha=1.0,
-        beta=2.0,
-        bandwidth_hz=10e6,
-        traffic_lambda=5000.0,
-        rate_scale_bps=1e6,
-        jfi_target=0.70,
-        lambda_jfi=2.0,
-        seed=0,
+        n_ue            =3,
+        n_rb_dl         =50,
+        episode_len     =500,
+        reward_mode     ="per_tti",
+        reward_window   =1,
+        alpha           =1.0,
+        beta            =2.0,
+        wb_cqi_report_period_tti = 5,
+        traffic_lambda  =5000.0,
+        rate_scale_bps  =1e6,
+        jfi_target      =0.70,
+        lambda_jfi      =2.0,
+        seed            =0,
+        traffic_profile =("full_buffer", "on_off", "bursty"),
     )
     return env
 
@@ -39,7 +40,7 @@ if __name__ == "__main__":
         buffer_size=100_000,
         learning_starts=5_000,
         batch_size=128,
-        train_freq=16,
+        train_freq=17,
         gamma=0.995,
         exploration_initial_eps=1.0,
         exploration_final_eps=0.10,
