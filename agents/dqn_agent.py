@@ -27,14 +27,14 @@ class DQNAgent:
 
     def __init__(
         self,
-        state_dim: int,
-        action_dim: int,
-        device=None,
-        epsilon_start: float = 1.0,
-        epsilon_end: float = 0.05,
+        state_dim:      int,
+        action_dim:     int,
+        device=         None,
+        epsilon_start:  float = 1.0,
+        epsilon_end:    float = 0.05,
+        gamma:          float = 0.99,
+        lr:             float = 1e-3,
         epsilon_decay_steps: int = 30_000,
-        gamma: float = 0.99,
-        lr: float = 1e-3,
     ):
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"

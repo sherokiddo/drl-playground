@@ -1,77 +1,58 @@
 import time
-import numpy as np
-
-from agents.lte_dqn_agent import LTEDQNAgent
-from envs.lte_padded_env import PaddedLTESchedulerEnv
 from envs.lte_scheduler_env import LTESchedulerEnv
+from stable_baselines3 import DQN
 
-
-MODEL_PATH = "runs/lte_dqn/lte_dqn_shared_q.pt"
-MAX_N_UE = 40
-EVAL_N_UE = 40
-
-
-def make_base_env(n_ue: int, seed: int | None = None) -> LTESchedulerEnv:
+def make_env():
     return LTESchedulerEnv(
-        n_ue=n_ue,
-        n_rb_dl=50,
+        n_ue=3,
+        n_rbg=16,
         episode_len=200,
         reward_mode="per_tti",
         reward_window=10,
-        wb_cqi_report_period_tti=5,
+        bandwidth_hz=10e6,
         traffic_lambda=5000.0,
-        traffic_profile="on_off",
-        seed=seed,
+        seed=123,
     )
-
-
-def make_env(n_ue: int, max_n_ue: int, seed: int | None = None) -> PaddedLTESchedulerEnv:
-    return PaddedLTESchedulerEnv(make_base_env(n_ue=n_ue, seed=seed), max_n_ue=max_n_ue)
-
-
-def sample_valid_action(action_mask: np.ndarray) -> int:
-    valid = np.flatnonzero(np.asarray(action_mask, dtype=bool))
-    if len(valid) == 0:
-        return 0
-    return int(np.random.choice(valid))
-
 
 if __name__ == "__main__":
-    env = make_env(n_ue=EVAL_N_UE, max_n_ue=MAX_N_UE, seed=123)
-    agent = LTEDQNAgent.load(MODEL_PATH)
+    model_path = "runs/dqn_scheduler/dqn_lte_scheduler.zip"
 
-    print(
-        f"[INFO] Benchmark mode: custom LTE DQN "
-        f"(env {EVAL_N_UE} UE, padded to {MAX_N_UE})"
-    )
+    env = make_env()
+    model = DQN.load(model_path, env=env)
 
     n_tti = 100
 
+    # 0) Прогрев
     obs, info = env.reset()
     for _ in range(10):
         for _ in range(env.n_rbg):
-            action = agent.predict(obs, info["action_mask"], deterministic=True)
+            action, _ = model.predict(obs, deterministic=True)
             obs, _, terminated, truncated, info = env.step(action)
             if terminated or truncated:
                 obs, info = env.reset()
 
+    # 1) ONLY PREDICT:
     obs, info = env.reset()
     start = time.perf_counter()
     for _ in range(n_tti):
         for _ in range(env.n_rbg):
-            _ = agent.predict(obs, info["action_mask"], deterministic=True)
+            action, _ = model.predict(obs, deterministic=True)
+            # env.step 
     end = time.perf_counter()
     total_predict = end - start
     print(f"Only predict - total: {total_predict*1000:.2f} ms")
     print(f"Only predict - per TTI: {(total_predict/n_tti)*1000:.4f} ms")
     print(f"Only predict - per RBG: {(total_predict/(n_tti*env.n_rbg))*1000:.4f} ms\n")
 
+    # 2) ONLY ENV.STEP: 
+    actions = [env.action_space.sample() for _ in range(n_tti * env.n_rbg)]
     obs, info = env.reset()
+    k = 0
     start = time.perf_counter()
     for _ in range(n_tti):
         for _ in range(env.n_rbg):
-            action = sample_valid_action(info["action_mask"])
-            obs, _, terminated, truncated, info = env.step(action)
+            obs, _, terminated, truncated, info = env.step(actions[k])
+            k += 1
             if terminated or truncated:
                 obs, info = env.reset()
     end = time.perf_counter()
@@ -80,11 +61,12 @@ if __name__ == "__main__":
     print(f"Only env.step - per TTI: {(total_step/n_tti)*1000:.4f} ms")
     print(f"Only env.step - per RBG: {(total_step/(n_tti*env.n_rbg))*1000:.4f} ms\n")
 
+    # 3) PREDICT + STEP: 
     obs, info = env.reset()
     start = time.perf_counter()
     for _ in range(n_tti):
         for _ in range(env.n_rbg):
-            action = agent.predict(obs, info["action_mask"], deterministic=True)
+            action, _ = model.predict(obs, deterministic=True)
             obs, _, terminated, truncated, info = env.step(action)
             if terminated or truncated:
                 obs, info = env.reset()

@@ -48,7 +48,7 @@ def main():
     max_steps_per_ep   = 100
 
     episode_rewards = []
-    success_flags   = []   # 1 если достигли цели в эпизоде
+    success_flags   = []  
 
     global_step = 0
 

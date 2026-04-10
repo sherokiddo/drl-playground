@@ -1,5 +1,3 @@
-# envs/frozen_lake_custom.py
-
 from __future__ import annotations
 
 import numpy as np
@@ -23,7 +21,7 @@ ACTION_NAMES = {
 
 class FrozenLakeCustom(gym.Env):
     """
-    Минимальная реализация FrozenLake-4x4 в стиле Gymnasium.
+    Минимальная реализация FrozenLake-4x4 под Gymnasium.
 
     Карта:
         S F F F
@@ -34,7 +32,7 @@ class FrozenLakeCustom(gym.Env):
     Легенда:
         S – старт
         F – безопасный лёд (reward=0)
-        H – яма (reward=0, terminated=True)
+        H – провал (reward=0, terminated=True)
         G – цель (reward=1, terminated=True)
 
     observation_space: Discrete(16) – индекс клетки 0..15
@@ -61,12 +59,8 @@ class FrozenLakeCustom(gym.Env):
         )
 
         self.nrow, self.ncol = self.desc.shape
-
-        # Пространства Gymnasium
         self.observation_space = spaces.Discrete(self.nrow * self.ncol)
         self.action_space      = spaces.Discrete(4)
-
-        # Текущее состояние (индекс клетки)
         self.s: int = 0
 
     # -------------------------
@@ -179,14 +173,14 @@ class FrozenLakeCustom(gym.Env):
         """Простейший текстовый рендер."""
         row, col = self._to_row_col(self.s)
 
-        desc = self.desc.astype("U1")  # bytes → str
+        desc = self.desc.astype("U1")
         grid = desc.tolist()
-        grid[row][col] = "A"          # пометим агента
+        grid[row][col] = "A" 
 
         lines = [" ".join(r) for r in grid]
         text  = "\n".join(lines)
 
         if self.render_mode == "human":
             print(text)
-        else:  # "ansi"
+        else: 
             return text

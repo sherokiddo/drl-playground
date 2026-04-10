@@ -280,9 +280,15 @@ class LTESchedulerEnv(gym.Env):
         self._traffic_on: np.ndarray   = None
         self._burst_timer: np.ndarray  = None
         self._active_flag: np.ndarray  = None
+        self._tti_active_mask: np.ndarray = None
 
-
-        self.history: Dict[str, list] = {"throughput": [], "se": [], "jfi": [], "reward": []}
+        self.history: Dict[str, list] = {
+            "throughput": [],
+            "se": [],
+            "jfi": [],
+            "jfi_all": [],
+            "reward": [],
+        }
 
     # ------------------------------------------------------------------
     # reset
@@ -327,6 +333,7 @@ class LTESchedulerEnv(gym.Env):
                 self._burst_timer[i] = 0
 
         self._active_flag = self._buffer > 0.0
+        self._tti_active_mask = self._active_flag.copy()
 
         self._rbg_alloc   = np.full(self.n_rbg, -1, dtype=np.int32)
         self._current_rbg = 0
@@ -336,7 +343,13 @@ class LTESchedulerEnv(gym.Env):
 
         self._last_rbg_alloc = None
         self.grid_history = []
-        self.history = {"throughput": [], "se": [], "jfi": [], "reward": []}
+        self.history = {
+            "throughput": [],
+            "se": [],
+            "jfi": [],
+            "jfi_all": [],
+            "reward": [],
+        }
         return self._get_obs(), self._get_info()
 
     # ------------------------------------------------------------------
@@ -377,6 +390,7 @@ class LTESchedulerEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def _process_tti(self) -> float:
+        tti_active_mask = self._tti_active_mask.copy()
         bits = self._compute_bits_delivered()
         self._update_buffers(bits)
 
@@ -393,18 +407,21 @@ class LTESchedulerEnv(gym.Env):
 
         throughput_bps = float(np.sum(tti_tput_bps))
         se_bps_hz      = throughput_bps / self.bandwidth_hz
-        jfi            = self._compute_jfi(self._avg_tput)
+        jfi_all        = self._compute_jfi(self._avg_tput)
+        jfi_active     = self._compute_jfi_masked(self._avg_tput, tti_active_mask)
 
         self.history["throughput"].append(throughput_bps / 1e6) 
         self.history["se"].append(se_bps_hz)
-        self.history["jfi"].append(jfi)
+        self.history["jfi"].append(jfi_active)
+        self.history["jfi_all"].append(jfi_all)
 
         tti_reward = self._compute_reward(
             se_bps_hz=se_bps_hz,
-            jfi=jfi,
+            jfi=jfi_active,
             prev_avg_tput=prev_avg_tput,
             tti_tput_bps=tti_tput_bps,
         )
+        self._tti_active_mask = self._active_flag.copy()
         if self.reward_mode == "per_tti":
             self.history["reward"].append(tti_reward)
             return tti_reward
@@ -544,6 +561,20 @@ class LTESchedulerEnv(gym.Env):
             return 0.0
         return (s ** 2) / (self.n_ue * ss)
 
+    def _compute_jfi_masked(self, bits: np.ndarray, mask: np.ndarray) -> float:
+        active_mask = np.asarray(mask, dtype=bool)
+        active_bits = np.asarray(bits, dtype=np.float64)[active_mask]
+        n_active = int(np.sum(active_mask))
+
+        if n_active == 0:
+            return 1.0
+
+        s = float(np.sum(active_bits))
+        ss = float(np.sum(active_bits ** 2))
+        if ss < 1e-12:
+            return 1.0
+        return (s ** 2) / (n_active * ss)
+
     def _compute_reward(
         self,
         se_bps_hz: float,
@@ -609,6 +640,7 @@ class LTESchedulerEnv(gym.Env):
             "rbg_size_rb":  self.rbg_size_rb,
             "rbg_rb_sizes": self.rbg_rb_sizes.copy(),
             "active_flag":  self._active_flag.copy(),
+            "tti_active_flag": self._tti_active_mask.copy(),
             "alloc_rbg_count_tti": alloc_count_per_ue,
             "alloc_rbg_frac_tti": alloc_frac_per_ue,
             "action_mask":  action_mask,
@@ -627,16 +659,21 @@ class LTESchedulerEnv(gym.Env):
             return {}
         tput = np.array(self.history["throughput"])
         se   = np.array(self.history["se"])
-        jfi  = np.array(self.history["jfi"])
-        rwd  = np.array(self.history["reward"])
+        jfi_active = np.array(self.history["jfi"])
+        jfi_all    = np.array(self.history["jfi_all"])
+        rwd        = np.array(self.history["reward"])
 
         return {
             "mean_throughput_mbps": float(np.mean(tput))      if len(tput) > 0 else 0.0,
             "mean_se_bps_hz":       float(np.mean(se))        if len(se)   > 0 else 0.0,
-            "mean_jfi":             float(np.mean(jfi))       if len(jfi)  > 0 else 0.0,
-            "mean_reward":          float(np.mean(rwd))       if len(rwd)  > 0 else 0.0,
-            "min_jfi":              float(np.min(jfi))        if len(jfi)  > 0 else 0.0,
-            "max_se_bps_hz":        float(np.max(se))         if len(se)   > 0 else 0.0,
+            "mean_jfi":             float(np.mean(jfi_active)) if len(jfi_active) > 0 else 0.0,
+            "mean_jfi_active":      float(np.mean(jfi_active)) if len(jfi_active) > 0 else 0.0,
+            "mean_jfi_all":         float(np.mean(jfi_all))    if len(jfi_all)    > 0 else 0.0,
+            "mean_reward":          float(np.mean(rwd))        if len(rwd)         > 0 else 0.0,
+            "min_jfi":              float(np.min(jfi_active))  if len(jfi_active) > 0 else 0.0,
+            "min_jfi_active":       float(np.min(jfi_active))  if len(jfi_active) > 0 else 0.0,
+            "min_jfi_all":          float(np.min(jfi_all))     if len(jfi_all)    > 0 else 0.0,
+            "max_se_bps_hz":        float(np.max(se))          if len(se)          > 0 else 0.0,
         }
     
     def render(self, mode: str = "human") -> None:
@@ -657,11 +694,14 @@ class LTESchedulerEnv(gym.Env):
         print(f"  CQIAge:   {self._wb_cqi_age.astype(int).tolist()}")
         print(f"  BufferKB: {[round(b/1024, 1) for b in self._buffer]}")
         print(f"  Active:   {self._active_flag.astype(int).tolist()}")
+        print(f"  TTIActive:{self._tti_active_mask.astype(int).tolist()}")
         print(f"  ActMask:  {self._get_action_mask().astype(int).tolist()}")
         print(f"  Traffic:  {self._traffic_mode.tolist()}")
         print(f"  AvgTput:  {[round(r/1e6, 3) for r in self._avg_tput]} Мбит/с")
         if self.history["jfi"]:
-            print(f"  JFI(avg): {self.history['jfi'][-1]:.3f}")
+            print(f"  JFI(act): {self.history['jfi'][-1]:.3f}")
+        if self.history["jfi_all"]:
+            print(f"  JFI(all): {self.history['jfi_all'][-1]:.3f}")
         if self.history["se"]:
             print(f"  SE:       {self.history['se'][-1]:.3f} бит/с/Гц")
         if self._last_rbg_alloc is not None:

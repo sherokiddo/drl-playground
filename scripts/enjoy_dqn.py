@@ -21,7 +21,6 @@ def main():
 
     weights_path = sys.argv[1]
 
-    # Создаём среду с визуализацией
     # render_mode="human" открывает окно с анимацией
     env = gym.make("CartPole-v1", render_mode="human")
 
