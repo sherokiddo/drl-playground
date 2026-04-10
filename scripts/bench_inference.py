@@ -1,15 +1,19 @@
 import time
+import numpy as np
+
+from agents.lte_dqn_agent import LTEDQNAgent
+from envs.lte_padded_env import PaddedLTESchedulerEnv
 from envs.lte_scheduler_env import LTESchedulerEnv
-from stable_baselines3 import DQN
-from utils.lte_transfer import predict_transfer_action
 
 
-MODEL_N_UE = 3
+MODEL_PATH = "runs/lte_dqn/lte_dqn_shared_q.pt"
+MAX_N_UE = 40
 EVAL_N_UE = 40
 
-def make_env():
+
+def make_base_env(n_ue: int, seed: int | None = None) -> LTESchedulerEnv:
     return LTESchedulerEnv(
-        n_ue=EVAL_N_UE,
+        n_ue=n_ue,
         n_rb_dl=50,
         episode_len=200,
         reward_mode="per_tti",
@@ -17,59 +21,57 @@ def make_env():
         wb_cqi_report_period_tti=5,
         traffic_lambda=5000.0,
         traffic_profile="on_off",
-        seed=123,
+        seed=seed,
     )
 
-if __name__ == "__main__":
-    model_path = "runs/dqn_scheduler/dqn_lte_scheduler.zip"
 
-    env = make_env()
-    model = DQN.load(model_path)
-    mode_label = "direct" if MODEL_N_UE == EVAL_N_UE else f"top-{MODEL_N_UE} PF transfer"
-    print(f"[INFO] Benchmark mode: {mode_label} (model {MODEL_N_UE} UE -> env {EVAL_N_UE} UE)")
+def make_env(n_ue: int, max_n_ue: int, seed: int | None = None) -> PaddedLTESchedulerEnv:
+    return PaddedLTESchedulerEnv(make_base_env(n_ue=n_ue, seed=seed), max_n_ue=max_n_ue)
+
+
+def sample_valid_action(action_mask: np.ndarray) -> int:
+    valid = np.flatnonzero(np.asarray(action_mask, dtype=bool))
+    if len(valid) == 0:
+        return 0
+    return int(np.random.choice(valid))
+
+
+if __name__ == "__main__":
+    env = make_env(n_ue=EVAL_N_UE, max_n_ue=MAX_N_UE, seed=123)
+    agent = LTEDQNAgent.load(MODEL_PATH)
+
+    print(
+        f"[INFO] Benchmark mode: custom LTE DQN "
+        f"(env {EVAL_N_UE} UE, padded to {MAX_N_UE})"
+    )
 
     n_tti = 100
 
-    # 0) Прогрев
     obs, info = env.reset()
     for _ in range(10):
         for _ in range(env.n_rbg):
-            action, _, _, _ = predict_transfer_action(
-                model=model,
-                env=env,
-                model_n_ue=MODEL_N_UE,
-                deterministic=True,
-            )
+            action = agent.predict(obs, info["action_mask"], deterministic=True)
             obs, _, terminated, truncated, info = env.step(action)
             if terminated or truncated:
                 obs, info = env.reset()
 
-    # 1) ONLY PREDICT:
     obs, info = env.reset()
     start = time.perf_counter()
     for _ in range(n_tti):
         for _ in range(env.n_rbg):
-            action, _, _, _ = predict_transfer_action(
-                model=model,
-                env=env,
-                model_n_ue=MODEL_N_UE,
-                deterministic=True,
-            )
+            _ = agent.predict(obs, info["action_mask"], deterministic=True)
     end = time.perf_counter()
     total_predict = end - start
     print(f"Only predict - total: {total_predict*1000:.2f} ms")
     print(f"Only predict - per TTI: {(total_predict/n_tti)*1000:.4f} ms")
     print(f"Only predict - per RBG: {(total_predict/(n_tti*env.n_rbg))*1000:.4f} ms\n")
 
-    # 2) ONLY ENV.STEP: 
-    actions = [env.action_space.sample() for _ in range(n_tti * env.n_rbg)]
     obs, info = env.reset()
-    k = 0
     start = time.perf_counter()
     for _ in range(n_tti):
         for _ in range(env.n_rbg):
-            obs, _, terminated, truncated, info = env.step(actions[k])
-            k += 1
+            action = sample_valid_action(info["action_mask"])
+            obs, _, terminated, truncated, info = env.step(action)
             if terminated or truncated:
                 obs, info = env.reset()
     end = time.perf_counter()
@@ -78,17 +80,11 @@ if __name__ == "__main__":
     print(f"Only env.step - per TTI: {(total_step/n_tti)*1000:.4f} ms")
     print(f"Only env.step - per RBG: {(total_step/(n_tti*env.n_rbg))*1000:.4f} ms\n")
 
-    # 3) PREDICT + STEP: 
     obs, info = env.reset()
     start = time.perf_counter()
     for _ in range(n_tti):
         for _ in range(env.n_rbg):
-            action, _, _, _ = predict_transfer_action(
-                model=model,
-                env=env,
-                model_n_ue=MODEL_N_UE,
-                deterministic=True,
-            )
+            action = agent.predict(obs, info["action_mask"], deterministic=True)
             obs, _, terminated, truncated, info = env.step(action)
             if terminated or truncated:
                 obs, info = env.reset()
